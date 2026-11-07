@@ -1,0 +1,22 @@
+[
+  {
+    "date": "2026-11-01T06:00:00-05:00",
+    "text": "SEASONAL OUTLOOK - Red River valley, spring 2027 (Mar-Jun): flood risk near normal. Too early for a confident outlook. Next update Dec 1.",
+    "weight": 0.18
+  },
+  {
+    "date": "2027-01-01T06:00:00-05:00",
+    "text": "SEASONAL OUTLOOK - Red River valley, spring 2027 (Mar-Jun): flood risk ABOVE normal due to heavy early snowfall. Start planning for a possible late or wet planting season.",
+    "weight": 0.36
+  },
+  {
+    "date": "2027-03-01T06:00:00-05:00",
+    "text": "SEASONAL OUTLOOK - Red River valley, spring 2027 (Mar-Jun): HIGH flood risk. Expect wet fields into May. Consider shorter-season crops for low areas and move stored grain and equipment to higher ground.",
+    "weight": 0.61
+  },
+  {
+    "date": "2027-04-01T06:00:00-05:00",
+    "text": "SEASONAL OUTLOOK - Red River valley, spring 2027 (Apr-Jun): HIGH flood risk. Melt is underway. Delay sowing on low-lying fields until water recedes. Short-term alerts will follow if flooding is imminent.",
+    "weight": 0.66
+  }
+]

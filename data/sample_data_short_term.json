@@ -1,0 +1,37 @@
+[
+  {
+    "date": "2026-04-08T06:00:00-05:00",
+    "text": "Red River near Winnipeg: no flood risk expected in the next 3 days.",
+    "weight": 0.04
+  },
+  {
+    "date": "2026-04-09T06:00:00-05:00",
+    "text": "Red River near Winnipeg: no flood risk expected in the next 3 days.",
+    "weight": 0.12
+  },
+  {
+    "date": "2026-04-10T06:00:00-05:00",
+    "text": "FLOOD WATCH - Red River near Winnipeg: river levels rising after snowmelt and rain. Flooding possible within 3 days. Stay alert for updates.",
+    "weight": 0.34
+  },
+  {
+    "date": "2026-04-11T06:00:00-05:00",
+    "text": "FLOOD WATCH - Red River near Winnipeg: flood risk increasing. Move valuables off basement floors and keep your phone charged.",
+    "weight": 0.51
+  },
+  {
+    "date": "2026-04-12T06:00:00-05:00",
+    "text": "FLOOD WARNING - Red River near Winnipeg: flooding likely within 3 days. Avoid low-lying areas and follow instructions from local officials.",
+    "weight": 0.73
+  },
+  {
+    "date": "2026-04-12T18:00:00-05:00",
+    "text": "FLOOD WARNING - Red River near Winnipeg: flooding expected within 24-48 hours. Prepare to leave if told to evacuate. Do not drive through flooded roads.",
+    "weight": 0.88
+  },
+  {
+    "date": "2026-04-15T06:00:00-05:00",
+    "text": "Red River near Winnipeg: flood risk has dropped. Stay away from riverbanks while water levels remain high.",
+    "weight": 0.22
+  }
+]
