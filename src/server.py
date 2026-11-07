@@ -1,3 +1,23 @@
+"""Flood alert dashboard (functions only, no classes).
+
+Run from the project root:
+    uv run --env-file twilio.env python src/server.py        (Ctrl+C to quit)
+
+Data files (lists of {"date", "text", "weight"}):
+    data/sample_data_short_term.json   recent changes in the water
+    data/sample_data_long_term.json    seasonal outlooks
+
+REPLAY = True  steps through both timelines, one entry every REPLAY_STEP seconds,
+               using each entry's own date as the clock. Starts fresh every run.
+REPLAY = False watches the files and treats the newest entry as current, using real
+               time. Send history is saved in state.json so restarts don't re-send.
+
+Short term: sent when the weight differs from the last SENT weight by >= SHORT_THRESHOLD
+            (and SHORT_COOLDOWN has passed since the last short-term send).
+Long term:  sent when LONG_INTERVAL has passed since the last long-term send, or when the
+            weight differs from the last sent weight by >= LONG_THRESHOLD.
+"""
+
 import json
 import os
 import time
@@ -15,19 +35,22 @@ from rich.text import Text
 
 import send as sms   # "as sms" so it doesn't clash with the send() function below
 
-SHORT_FILE = Path("short_term.json")
-LONG_FILE = Path("long_term.json")
-STATE_FILE = Path("state.json")
+ROOT = Path(__file__).resolve().parent.parent      # project root (src/..)
+DATA_DIR = ROOT / "data"
+SHORT_FILE = DATA_DIR / "sample_data_short_term.json"
+LONG_FILE = DATA_DIR / "sample_data_long_term.json"
+STATE_FILE = ROOT / "state.json"                   # only used when REPLAY = False
 
-SHORT_THRESHOLD = 0.5
+REPLAY = True
+REPLAY_STEP = 6                       # real seconds between timeline entries
+
+SHORT_THRESHOLD = 0.3
 SHORT_COOLDOWN = 20                   # seconds
 LONG_THRESHOLD = 0.6
-LONG_INTERVAL = 61 * 24 * 3600       # ~2 months, in seconds
+LONG_INTERVAL = 55 * 24 * 3600        # ~2 months (outlooks arrive every ~2 months)
 
-# Sample numbers (users subscribed)
+# Subscribed users (must be verified numbers on a Twilio trial account)
 USERS = ["647-668-6246"]
-
-MESSAGE_PREFIX = {"short": "Flood alert: ", "long": "Flood outlook: "}
 
 
 def to_e164(number):
@@ -37,11 +60,14 @@ def to_e164(number):
         digits = "1" + digits
     return "+" + digits
 
+
 # ---------------------------------------------------------------- state
 
 feeds = {
-    "short": {"file": SHORT_FILE, "mtime": None, "data": None},
-    "long": {"file": LONG_FILE, "mtime": None, "data": None},
+    "short": {"file": SHORT_FILE, "mtime": None, "entries": [], "index": -1,
+              "current": None, "new": False, "decision": Text("-", style="dim")},
+    "long": {"file": LONG_FILE, "mtime": None, "entries": [], "index": -1,
+             "current": None, "new": False, "decision": Text("-", style="dim")},
 }
 state = {
     "short": {"last_weight": None, "last_time": 0.0},
@@ -53,28 +79,40 @@ counts = {
     for u in USERS
 }
 totals = {"short": 0, "long": 0, "received": 0}
-log = deque(maxlen=8)
+log = deque(maxlen=10)
 pending = []   # (future, user, kind) for sends still waiting on a delivery report
 
+
 def load_state():
-    if STATE_FILE.exists():
+    if not REPLAY and STATE_FILE.exists():
         state.update(json.loads(STATE_FILE.read_text()))
 
 
 def save_state():
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    if not REPLAY:
+        STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def read_feed(path):
-    data = json.loads(path.read_text())
-    if isinstance(data, list):
-        data = data[-1]
-    return {"description": str(data["description"]), "weight": float(data["weight"])}
+def read_entries(path):
+    """Load a timeline file -> list of entries sorted by date."""
+    raw = json.loads(path.read_text())
+    if isinstance(raw, dict):
+        raw = [raw]
+    entries = [{"date": datetime.fromisoformat(e["date"]),
+                "text": str(e["text"]),
+                "weight": float(e["weight"])} for e in raw]
+    return sorted(entries, key=lambda e: e["date"])
 
 
-def refresh_feeds():
-    """Reload a feed only when its file has changed on disk."""
-    for feed in feeds.values():
+def set_current(feed, index):
+    feed["index"] = index
+    feed["current"] = feed["entries"][index]
+    feed["new"] = True
+
+
+def load_files():
+    """Load both files (live mode: only when they change on disk)."""
+    for name, feed in feeds.items():
         try:
             mtime = feed["file"].stat().st_mtime
         except FileNotFoundError:
@@ -82,60 +120,110 @@ def refresh_feeds():
         if mtime == feed["mtime"]:
             continue
         try:
-            feed["data"] = read_feed(feed["file"])
+            entries = read_entries(feed["file"])
         except (json.JSONDecodeError, KeyError, ValueError, TypeError):
             continue  # half-written or malformed; try again next tick
         feed["mtime"] = mtime
+        feed["entries"] = entries
         log.append(Text.from_markup(
-            f"[dim]{now_stamp()}[/] [blue]{feed['file'].name} loaded[/] "
-            f"(weight {feed['data']['weight']:.2f})"))
+            f"[dim]{now_stamp()}[/] [blue]{feed['file'].name} loaded[/] ({len(entries)} entries)"))
+        if not REPLAY and entries:
+            newest = len(entries) - 1
+            if feed["current"] is None or entries[newest]["date"] != feed["current"]["date"]:
+                set_current(feed, newest)
+
+
+def advance_replay():
+    """Move each feed to its next timeline entry."""
+    for feed in feeds.values():
+        if feed["index"] + 1 < len(feed["entries"]):
+            set_current(feed, feed["index"] + 1)
+
+
+def replay_finished():
+    return all(f["index"] >= len(f["entries"]) - 1 and not f["new"] for f in feeds.values())
+
+
+def clock(feed):
+    """Replay: the entry's own date. Live: real time."""
+    if REPLAY and feed["current"]:
+        return feed["current"]["date"].timestamp()
+    return time.time()
 
 
 # ---------------------------------------------------------------- decision logic
 
-def should_send_short(weight, st, now):
-    if st["last_weight"] is None:      # never sent before
-        return True
-    big_enough = abs(weight - st["last_weight"]) >= SHORT_THRESHOLD
-    cooled = now - st["last_time"] >= SHORT_COOLDOWN
-    return big_enough and cooled
-
-
-def should_send_long(weight, st, now):
+def decide_short(weight, st, now):
     if st["last_weight"] is None:
-        return True
-    due = now - st["last_time"] >= LONG_INTERVAL
-    big_change = abs(weight - st["last_weight"]) >= LONG_THRESHOLD
-    return due or big_change
+        return True, "first update"
+    change = abs(weight - st["last_weight"])
+    if change < SHORT_THRESHOLD:
+        return False, f"change {change:.2f} < {SHORT_THRESHOLD}"
+    if now - st["last_time"] < SHORT_COOLDOWN:
+        return False, "cooldown"
+    return True, f"change {change:.2f}"
 
 
-def check_and_send(now):
-    # Checked every tick, so a big change that lands during the cooldown
-    # still goes out once the cooldown ends.
-    for kind, check in (("short", should_send_short), ("long", should_send_long)):
-        data = feeds[kind]["data"]
-        if data and check(data["weight"], state[kind], now):
-            send(kind, data, now)
+def decide_long(weight, st, now):
+    if st["last_weight"] is None:
+        return True, "first outlook"
+    days = (now - st["last_time"]) / 86400
+    change = abs(weight - st["last_weight"])
+    if now - st["last_time"] >= LONG_INTERVAL:
+        return True, f"scheduled, {days:.0f} days since last"
+    if change >= LONG_THRESHOLD:
+        return True, f"big change {change:.2f}"
+    return False, f"{days:.0f} days since last, change {change:.2f}"
+
+
+def check_feeds():
+    for kind, decide in (("short", decide_short), ("long", decide_long)):
+        feed = feeds[kind]
+        entry = feed["current"]
+        if entry is None:
+            continue
+        now = clock(feed)
+
+        if feed["new"]:
+            ok, reason = decide(entry["weight"], state[kind], now)
+            if ok:
+                feed["new"] = False
+                feed["decision"] = Text(f"sent · {reason}", style="green")
+                send(kind, entry, now)
+            elif reason == "cooldown":
+                feed["decision"] = Text("waiting for cooldown", style="yellow")  # retried next tick
+            else:
+                feed["new"] = False
+                feed["decision"] = Text(f"skipped · {reason}", style="dim")
+                log.append(Text.from_markup(
+                    f"[dim]{now_stamp()} SKIP  {kind:<5} weight {entry['weight']:.2f} ({reason})[/]"))
+
+        elif (kind == "long" and not REPLAY and state["long"]["last_weight"] is not None
+              and now - state["long"]["last_time"] >= LONG_INTERVAL):
+            feed["decision"] = Text("sent · scheduled resend", style="green")
+            send(kind, entry, now)
 
 
 # ---------------------------------------------------------------- sending
 
-def send(kind, data, now):
-    color = weight_color(data["weight"])
+def send(kind, entry, now):
+    color = weight_color(entry["weight"])
     label = "SHORT" if kind == "short" else "LONG"
-    text = MESSAGE_PREFIX[kind] + data["description"]
+    text = entry["text"]
+    parts = sms.sms_segments(text)
 
     for u in USERS:   # later: only users near the flood area
         pending.append((sms.send_async(to_e164(u), text), u, kind))
         c = counts[u]
         c[kind] += 1
         totals[kind] += 1
-        c["last"] = Text(f"[{label}] {data['description']}", style=color)
+        c["last"] = Text(f"[{label}] {text}", style=color)
         c["status"] = Text("● sending", style="yellow")
         log.append(Text.from_markup(
-            f"[dim]{now_stamp()}[/] [{color}]{label:<5}[/] → {u}: {escape(data['description'])}"))
+            f"[dim]{now_stamp()}[/] [{color}]{label:<5}[/] → {u}: {escape(text)}"
+            + (f" [dim]({parts} SMS)[/]" if parts > 1 else "")))
 
-    state[kind]["last_weight"] = data["weight"]
+    state[kind]["last_weight"] = entry["weight"]
     state[kind]["last_time"] = now
     save_state()
 
@@ -191,37 +279,37 @@ def build_stats():
     grid.add_row(
         stat("Short-term sent", totals["short"], "yellow"),
         stat("Long-term sent", totals["long"], "magenta"),
-        stat("Received", totals["received"], "green"),
+        stat("Delivered", totals["received"], "green"),
         stat("Users", len(USERS)),
     )
     return grid
 
 
-def build_feeds(now):
-    grid = Table.grid(padding=(0, 2))
-    grid.add_column(style="bold")
-    grid.add_column()
+def build_feeds():
+    table = Table(expand=True, box=None, header_style="bold")
+    table.add_column("Feed")
+    table.add_column("Step", justify="right")
+    table.add_column("Date")
+    table.add_column("Weight", justify="right")
+    table.add_column("Last sent", justify="right")
+    table.add_column("Decision", ratio=1)
 
-    s, st = feeds["short"]["data"], state["short"]
-    if s:
-        cooldown = max(0, SHORT_COOLDOWN - (now - st["last_time"]))
-        grid.add_row("Short-term", Text.from_markup(
-            f"weight [b {weight_color(s['weight'])}]{s['weight']:.2f}[/] · "
-            f"last sent {fmt(st['last_weight'])} · cooldown {cooldown:.0f}s"))
-    else:
-        grid.add_row("Short-term", Text(f"waiting for {SHORT_FILE.name}", style="dim"))
-
-    l, lt = feeds["long"]["data"], state["long"]
-    if l:
-        next_due = (datetime.fromtimestamp(lt["last_time"] + LONG_INTERVAL).strftime("%Y-%m-%d")
-                    if lt["last_weight"] is not None else "now")
-        grid.add_row("Long-term", Text.from_markup(
-            f"weight [b {weight_color(l['weight'])}]{l['weight']:.2f}[/] · "
-            f"last sent {fmt(lt['last_weight'])} · next scheduled {next_due}"))
-    else:
-        grid.add_row("Long-term", Text(f"waiting for {LONG_FILE.name}", style="dim"))
-
-    return Panel(grid, title="Feeds", border_style="blue")
+    for kind, name in (("short", "Short-term"), ("long", "Long-term")):
+        feed, st = feeds[kind], state[kind]
+        entry = feed["current"]
+        if entry is None:
+            table.add_row(name, "-", Text(f"waiting for {feed['file'].name}", style="dim"),
+                          "-", "-", "")
+            continue
+        table.add_row(
+            name,
+            f"{feed['index'] + 1}/{len(feed['entries'])}",
+            entry["date"].strftime("%Y-%m-%d %H:%M"),
+            Text(f"{entry['weight']:.2f}", style=f"bold {weight_color(entry['weight'])}"),
+            fmt(st["last_weight"]),
+            feed["decision"],
+        )
+    return Panel(table, title="Feeds", border_style="blue")
 
 
 def build_table():
@@ -229,7 +317,7 @@ def build_table():
     table.add_column("User")
     table.add_column("Short", justify="right")
     table.add_column("Long", justify="right")
-    table.add_column("Received", justify="right")
+    table.add_column("Delivered", justify="right")
     table.add_column("Last message", ratio=1)
     table.add_column("Status")
     for u in USERS:
@@ -240,21 +328,29 @@ def build_table():
 
 
 def build_log():
-    body = Group(*log) if log else Text("Waiting for first send…", style="dim")
+    body = Group(*log) if log else Text("Waiting for first update…", style="dim")
     return Panel(body, title="Log", border_style="dim")
 
 
-def build_screen(now):
+def build_header():
+    mode = "[yellow]DRY RUN[/]" if sms.DRY_RUN else "[green]LIVE SMS[/]"
+    if REPLAY:
+        data = "[cyan]replay finished[/]" if replay_finished() else "[cyan]REPLAY[/]"
+    else:
+        data = "[cyan]LIVE DATA[/]"
+    return Text.from_markup(
+        f"[b]Flood Alert Showcase[/b]  ·  {mode}  ·  {data}  ·  Ctrl+C to quit",
+        justify="center")
+
+
+def build_screen():
     layout = Layout()
     layout.split_column(
-        Layout(Text.from_markup(
-            "[b]Flood Alert Showcase[/b]  ·  "
-            + ("[yellow]DRY RUN[/]" if sms.DRY_RUN else "[green]LIVE SMS[/]")
-            + "  ·  Ctrl+C to quit", justify="center"), size=1),
+        Layout(build_header(), size=1),
         Layout(build_stats(), size=4),
-        Layout(build_feeds(now), size=4),
+        Layout(build_feeds(), size=5),
         Layout(build_table(), ratio=1),
-        Layout(build_log(), size=10),
+        Layout(build_log(), size=12),
     )
     return layout
 
@@ -263,14 +359,20 @@ def build_screen(now):
 
 def main():
     load_state()
-    with Live(build_screen(time.time()), screen=True, refresh_per_second=4) as live:
+    load_files()
+    next_step = time.time()
+    with Live(build_screen(), screen=True, refresh_per_second=4) as live:
         try:
             while True:
-                now = time.time()
-                refresh_feeds()
-                check_and_send(now)
+                if REPLAY:
+                    if time.time() >= next_step:
+                        advance_replay()
+                        next_step = time.time() + REPLAY_STEP
+                else:
+                    load_files()
+                check_feeds()
                 collect_results()
-                live.update(build_screen(now))
+                live.update(build_screen())
                 time.sleep(0.5)
         except KeyboardInterrupt:
             pass
