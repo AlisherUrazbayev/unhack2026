@@ -16,6 +16,9 @@ Short term: sent when the weight differs from the last SENT weight by >= SHORT_T
             (and SHORT_COOLDOWN has passed since the last short-term send).
 Long term:  sent when LONG_INTERVAL has passed since the last long-term send, or when the
             weight differs from the last sent weight by >= LONG_THRESHOLD.
+
+Recipients are everyone opted in through optin.py (data/subscribers.db), read fresh
+before every send. Anyone who replies STOP is marked as opted out automatically.
 """
 
 import json
@@ -33,6 +36,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+import db
 import send as sms   # "as sms" so it doesn't clash with the send() function below
 
 ROOT = Path(__file__).resolve().parent.parent      # project root (src/..)
@@ -49,16 +53,7 @@ SHORT_COOLDOWN = 20                   # seconds
 LONG_THRESHOLD = 0.6
 LONG_INTERVAL = 55 * 24 * 3600        # ~2 months (outlooks arrive every ~2 months)
 
-# Subscribed users (must be verified numbers on a Twilio trial account)
-USERS = ["647-668-6246"]
-
-
-def to_e164(number):
-    """'647-668-6246' -> '+16476686246' (Twilio needs this format)."""
-    digits = "".join(ch for ch in number if ch.isdigit())
-    if len(digits) == 10:
-        digits = "1" + digits
-    return "+" + digits
+SUBSCRIBER_REFRESH = 2                # seconds between re-reading the subscriber list
 
 
 # ---------------------------------------------------------------- state
@@ -73,14 +68,28 @@ state = {
     "short": {"last_weight": None, "last_time": 0.0},
     "long": {"last_weight": None, "last_time": 0.0},
 }
-counts = {
-    u: {"short": 0, "long": 0, "received": 0,
-        "last": Text("-", style="dim"), "status": Text("idle", style="dim")}
-    for u in USERS
-}
+subscribers = []   # opted-in phones (E.164), refreshed from the database
+counts = {}        # per-phone stats, created the first time a phone appears
 totals = {"short": 0, "long": 0, "received": 0}
 log = deque(maxlen=10)
 pending = []   # (future, user, kind) for sends still waiting on a delivery report
+
+
+def user_counts(phone):
+    return counts.setdefault(phone, {
+        "short": 0, "long": 0, "received": 0,
+        "last": Text("-", style="dim"), "status": Text("subscribed", style="dim")})
+
+
+def refresh_subscribers():
+    """Re-read who is opted in (picks up sign-ups and opt-outs while running)."""
+    global subscribers
+    try:
+        subscribers = db.active_phones()
+    except Exception as e:   # e.g. database briefly locked; keep the last list
+        log.append(Text(f"{now_stamp()} could not read subscribers: {e}", style="red"))
+    for phone in subscribers:
+        user_counts(phone)
 
 
 def load_state():
@@ -212,16 +221,21 @@ def send(kind, entry, now):
     text = entry["text"]
     parts = sms.sms_segments(text)
 
-    for u in USERS:   # later: only users near the flood area
-        pending.append((sms.send_async(to_e164(u), text), u, kind))
-        c = counts[u]
+    refresh_subscribers()   # always send to the latest list
+    if not subscribers:
+        log.append(Text.from_markup(
+            f"[dim]{now_stamp()}[/] [{color}]{label:<5}[/] [dim]no subscribers, nothing sent[/]"))
+
+    for phone in subscribers:   # later: only subscribers near the flood area
+        pending.append((sms.send_async(phone, text), phone, kind))
+        c = user_counts(phone)
         c[kind] += 1
         totals[kind] += 1
         c["last"] = Text(f"[{label}] {text}", style=color)
         c["status"] = Text("● sending", style="yellow")
         log.append(Text.from_markup(
-            f"[dim]{now_stamp()}[/] [{color}]{label:<5}[/] → {u}: {escape(text)}"
-            + (f" [dim]({parts} SMS)[/]" if parts > 1 else "")))
+            f"[dim]{now_stamp()}[/] [{color}]{label:<5}[/] → {db.pretty_phone(phone)}: "
+            f"{escape(text)}" + (f" [dim]({parts} SMS)[/]" if parts > 1 else "")))
 
     state[kind]["last_weight"] = entry["weight"]
     state[kind]["last_time"] = now
@@ -236,16 +250,22 @@ def collect_results():
             continue
         pending.remove(item)
         message_id, status, error = future.result()
-        c = counts[u]
+        c = user_counts(u)
+        name = db.pretty_phone(u)
         if status == "delivered":
             c["received"] += 1
             totals["received"] += 1
             c["status"] = Text("● delivered", style="green")
-            log.append(Text.from_markup(f"[dim]{now_stamp()}[/] [green]✓ delivered[/] → {u}"))
+            log.append(Text.from_markup(f"[dim]{now_stamp()}[/] [green]✓ delivered[/] → {name}"))
+        elif error and error.startswith(str(sms.ERROR_OPTED_OUT)):
+            db.unsubscribe(u)   # they replied STOP; keep the database in sync
+            c["status"] = Text("● replied STOP", style="red")
+            log.append(Text.from_markup(
+                f"[dim]{now_stamp()}[/] [red]✗ {name} replied STOP, marked as opted out[/]"))
         else:
             c["status"] = Text(f"● {status}", style="red")
             log.append(Text.from_markup(
-                f"[dim]{now_stamp()}[/] [red]✗ {status}[/] → {u}"
+                f"[dim]{now_stamp()}[/] [red]✗ {status}[/] → {name}"
                 + (f": {escape(error)}" if error else "")))
 
 
@@ -280,7 +300,7 @@ def build_stats():
         stat("Short-term sent", totals["short"], "yellow"),
         stat("Long-term sent", totals["long"], "magenta"),
         stat("Delivered", totals["received"], "green"),
-        stat("Users", len(USERS)),
+        stat("Subscribers", len(subscribers)),
     )
     return grid
 
@@ -313,17 +333,22 @@ def build_feeds():
 
 
 def build_table():
-    table = Table(expand=True, header_style="bold", border_style="dim", title="Nearby users")
-    table.add_column("User")
+    table = Table(expand=True, header_style="bold", border_style="dim", title="Subscribers")
+    table.add_column("Phone")
     table.add_column("Short", justify="right")
     table.add_column("Long", justify="right")
     table.add_column("Delivered", justify="right")
     table.add_column("Last message", ratio=1)
     table.add_column("Status")
-    for u in USERS:
-        c = counts[u]
-        table.add_row(u, str(c["short"]), str(c["long"]), str(c["received"]),
-                      c["last"], c["status"])
+    if not counts:
+        table.add_row(Text("no one has opted in yet — run optin.py", style="dim"),
+                      "", "", "", "", "")
+    for phone, c in counts.items():
+        active = phone in subscribers
+        status = c["status"] if active else Text("opted out", style="dim")
+        table.add_row(Text(db.pretty_phone(phone), style="" if active else "dim strike"),
+                      str(c["short"]), str(c["long"]), str(c["received"]),
+                      c["last"], status)
     return table
 
 
@@ -360,10 +385,15 @@ def build_screen():
 def main():
     load_state()
     load_files()
+    refresh_subscribers()
     next_step = time.time()
+    next_refresh = time.time() + SUBSCRIBER_REFRESH
     with Live(build_screen(), screen=True, refresh_per_second=4) as live:
         try:
             while True:
+                if time.time() >= next_refresh:
+                    refresh_subscribers()
+                    next_refresh = time.time() + SUBSCRIBER_REFRESH
                 if REPLAY:
                     if time.time() >= next_step:
                         advance_replay()

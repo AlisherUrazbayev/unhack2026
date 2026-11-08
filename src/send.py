@@ -1,20 +1,18 @@
 """SMS sending through Twilio (functions only, no classes).
 
-Setup:
-    uv add twilio
-    export TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxx
-    export TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxx
-    export TWILIO_FROM_NUMBER=+1647xxxxxxx      # your Twilio number
+Setup (twilio.env in the project root, loaded with `uv run --env-file twilio.env ...`):
+    TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxx
+    TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxx
+    TWILIO_FROM_NUMBER=+1xxxxxxxxxx
 
 If those aren't set, this runs in DRY RUN mode: nothing is actually sent and
-every message is reported as delivered, so the dashboard still works offline.
+every message is reported as delivered, so the apps still work offline.
 
-Phone numbers must be in E.164 format, e.g. +14165550123.
-Twilio trial accounts can only text numbers you've verified in the console.
+Phone numbers must be in E.164 format, e.g. +14165550123 (db.to_e164 converts them).
 
-Usage from app.py:
-    import sender
-    future = sender.send_async("+14165550123", "Flood warning near you")
+Usage:
+    import send as sms
+    future = sms.send_async("+14165550123", "Flood warning near you")
     ...later, once future.done():
     message_id, status, error = future.result()   # status: "delivered", "failed", ...
 """
@@ -33,6 +31,8 @@ FINAL_STATUSES = {"delivered", "undelivered", "failed"}
 STATUS_TIMEOUT = 120      # seconds to wait for a delivery report
 POLL_EVERY = 3            # seconds between status checks
 
+ERROR_OPTED_OUT = 21610   # recipient replied STOP; Twilio blocks texts to them
+
 _client = None
 _executor = ThreadPoolExecutor(max_workers=8)   # sends run here so the UI never freezes
 
@@ -45,6 +45,13 @@ def get_client():
     return _client
 
 
+def format_error(e):
+    """Short, readable error like '21610: Attempt to send to unsubscribed recipient'."""
+    code = getattr(e, "code", None)
+    msg = getattr(e, "msg", None) or str(e)
+    return f"{code}: {msg}" if code else msg
+
+
 def send_sms(phone, text):
     """Send one SMS (blocking). Returns (message_id, error)."""
     if DRY_RUN:
@@ -53,7 +60,7 @@ def send_sms(phone, text):
         msg = get_client().messages.create(to=phone, from_=FROM_NUMBER, body=text)
         return msg.sid, None
     except Exception as e:   # TwilioRestException, bad number, network error...
-        return None, str(e)
+        return None, format_error(e)
 
 
 def get_status(message_id):
@@ -96,7 +103,7 @@ def sms_segments(text):
 
 
 if __name__ == "__main__":
-    # Quick test: uv run python sender.py +14165550123
+    # Quick test: uv run --env-file twilio.env python src/send.py +14165550123
     import sys
     number = sys.argv[1] if len(sys.argv) > 1 else "+15555550100"
     print("DRY RUN" if DRY_RUN else "LIVE", "→", number)
